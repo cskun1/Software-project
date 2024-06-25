@@ -1,0 +1,91 @@
+import pandas as pd
+import numpy as np
+import gdown
+import os
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
+from scipy.sparse.linalg import spsolve
+
+# Function to download and read CSV files from Google Drive
+def download_and_read_csv(file_id, file_name):
+    url = f"https://drive.google.com/uc?id={file_id}"
+    output_name = f"temp_{file_name}.csv"
+    gdown.download(url, output_name, quiet=False)
+    df = pd.read_csv(output_name)
+    os.remove(output_name)  # Remove the file after reading
+    return df
+
+# File IDs for Google Drive CSV files
+books_file_id = "1uA6Qvu62cNabOHvkxVKfbWr7ANegoRlM"
+ratings_file_id = "1q2nIvGeUTkRpLNxmtvafmDXX-j-8qsQD"
+users_file_id = "1V9Nnswk6a3bTitu2Lw4UN_8E7quUIcbx"
+
+# Download and read CSV files
+book_df = download_and_read_csv(books_file_id, "books")
+rating_df = download_and_read_csv(ratings_file_id, "ratings")
+user_df = download_and_read_csv(users_file_id, "users")
+
+# Merge dataframes
+user_rating_df = pd.merge(rating_df, user_df, on="User-ID")
+book_user_rating = pd.merge(book_df, user_rating_df, on='ISBN')
+book_user_rating = book_user_rating[['ISBN', 'Book-Title', 'Book-Author', 'User-ID', 'Book-Rating']]
+book_user_rating.reset_index(drop=True, inplace=True)
+
+# Create unique book IDs
+d = {j: i for i, j in enumerate(book_user_rating.ISBN.unique())}
+book_user_rating['unique_id_book'] = book_user_rating['ISBN'].map(d)
+
+# Pivot table creation in smaller chunks
+batch_size = 10000
+num_batches = len(book_user_rating) // batch_size + 1
+pivot_chunks = []
+
+for i in range(num_batches):
+    start_idx = i * batch_size
+    end_idx = min((i + 1) * batch_size, len(book_user_rating))
+    chunk = book_user_rating.iloc[start_idx:end_idx].pivot(
+        index='User-ID', columns='unique_id_book', values='Book-Rating').fillna(0)
+    pivot_chunks.append(chunk)
+
+# Concatenate pivot chunks
+users_books_pivot_matrix_df = pd.concat(pivot_chunks, axis=1)
+
+# Convert to sparse matrix and ensure float data type
+users_books_pivot_matrix = csr_matrix(users_books_pivot_matrix_df.values).astype(float)
+
+# Matrix factorization function using SVD
+def svd_factorization(matrix, k):
+    U, sigma, Vt = svds(matrix, k=k)
+    sigma = np.diag(sigma)
+    return U, sigma, Vt
+
+# Perform SVD matrix factorization
+NUMBER_OF_FACTORS_MF = 15
+U, sigma, Vt = svd_factorization(users_books_pivot_matrix, k=NUMBER_OF_FACTORS_MF)
+sigma = np.diag(sigma)
+
+# Reconstruct the matrix
+all_user_predicted_ratings = np.dot(np.dot(U, sigma), Vt)
+
+# Function to get top similar books based on cosine similarity
+def top_cosine_similarity(data, book_id, top_n=10):
+    book_row = data[book_id, :]
+    magnitude = np.sqrt(np.einsum('ij, ij -> i', data, data))
+    similarity = np.dot(book_row, data.T) / (magnitude[book_id] * magnitude)
+    sort_indexes = np.argsort(-similarity)
+    return sort_indexes[:top_n]
+
+# Function to get similar books
+def similar_books(book_user_rating, book_id, top_indexes):
+    print('Recommendations for {0}: \n'.format(
+        book_user_rating[book_user_rating.unique_id_book == book_id]['Book-Title'].values[0]))
+    for idx in top_indexes[1:]:  # Skip the first item since it's the same book
+        print(book_user_rating[book_user_rating.unique_id_book == idx]['Book-Title'].values[0])
+
+# Example usage: Recommend top similar books
+book_id = 25954  # Example book ID, ensure it exists in your dataset
+top_n = 3
+
+# Get top similar books
+top_indexes = top_cosine_similarity(Vt.T, book_id, top_n)
+similar_books(book_user_rating, book_id, top_indexes)
